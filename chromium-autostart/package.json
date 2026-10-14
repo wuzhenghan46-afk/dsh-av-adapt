@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-chromium-autostart",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 启动后自动拉起 web-access skill 用的 headless Chromium",
+  "exports": { ".": "./index.js" },
+  "meta": {
+    "title": "Chromium 自启",
+    "description": "DSH 启动后自动拉起 web-access 的 headless Chromium，CDP 通道免手动"
+  },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

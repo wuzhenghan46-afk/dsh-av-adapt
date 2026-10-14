@@ -1,0 +1,5 @@
+- insert:
+    - id: chromium-autostart
+      name: 'dsh-plugin-chromium-autostart'
+      config:
+        delayMs: 8000
