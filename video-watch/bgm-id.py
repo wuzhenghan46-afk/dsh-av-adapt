@@ -20,6 +20,14 @@
 需要 application key：环境变量 ACOUSTID_KEY → ~/.dsh/acoustid-key.txt → 内置兜底。
 注意 AcoustID 几乎不抗人声：实测同一首曲子干净时命中 94.5%，
 混入说话后立刻无匹配。所以它在混合场景只是补充，主力永远是 Shazam。
+
+⚠️ 读结果时先分清一件事：**Shazam 报的是「匹配到的那个录音版本」，不等于「你听到的整个作品」**。
+   实测案例（BV1N2aV6wELJ）：视频人声是自己录的 rap，但伴奏**直接采样**了
+   Struggle Baby (feat. Yung Lyon) — Glizzy Gwapo，Shazam 照常报出那首歌
+   —— 它匹配的是**伴奏的指纹**。所以：
+     · 整段就是那首歌        → 结果说明音频来源；
+     · 借了伴奏做 rap/翻唱/remix → 结果只说明 **beat 的来源**，人声是谁的它答不了。
+   两种情况都"识别成功"，但正确解读完全不同。
 """
 import asyncio
 import json
