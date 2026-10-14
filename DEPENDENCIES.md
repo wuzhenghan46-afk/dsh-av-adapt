@@ -183,3 +183,9 @@ Python      faster-whisper 1.2.1 · rapidocr-onnxruntime 1.4.4 · onnxruntime 1.
             numpy 2.5.4 · Pillow 12.3.0
 模型        faster-whisper base 142MB · htdemucs 81MB
 ```
+
+---
+
+> **有 DSH 操作，仅供参考。** 本清单来自一台具体 Android 手机容器上的实测，
+> 版本号与体积都是**当时**的值；换环境、隔一段时间，数字都会变。
+> 拿它当"要装哪些东西"的索引可以，当"照抄就能跑"的保证不行。
