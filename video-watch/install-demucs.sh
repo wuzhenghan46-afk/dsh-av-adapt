@@ -19,6 +19,14 @@
 #  4. 用清华 PyPI 索引解析依赖可能超时（高峰期实测索引页 0.3~15 KB/s）。
 #     大文件一律用 curl -C - 断点续传单独下，比 pip 稳。
 #  5. 首次推理会自动下 htdemucs 模型（约 80MB）。
+#  6. **卸载也要 --break-system-packages**：PEP 668 的 externally-managed-environment
+#     对 install 和 uninstall 一视同仁，漏了会直接报错退出。回滚命令：
+#       python3 -m pip uninstall -y --break-system-packages torch torchaudio demucs soundfile
+#  7. **干净环境下 torch 解包极慢**：本机是 proot 容器，每个系统调用都被 ptrace 拦一次，
+#     torch 有 1.3 万个文件，实测解包要 10 分钟以上（看着像卡死，其实在跑）。
+#     期间如果内存吃紧（实测可用内存掉到 300MB 左右、还有别的构建任务在跑），
+#     pip 会 **Bus error** 崩掉 —— 脚本因 set -e 正确中止，但报错信息不直观。
+#     建议：跑之前确认没有别的重活，可用内存留 3GB 以上。
 set -euo pipefail   # 早先没 -e，校验失败也返回 0（评审指出）
 
 PYPI="-i https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -67,7 +75,11 @@ fi
 # ── 3. demucs 4.0.1 与其余依赖（不碰 torch，避免被换成 CUDA 版）───────
 if ! need demucs; then
   echo "③ 装 demucs 4.0.1 及依赖…"
-  python3 -m pip install --break-system-packages -q $PYPI \
+  # --no-deps 是关键：demucs 与 openunmix 都声明了 torch/torchaudio 依赖，
+  # 放开解析会让 pip 把上面辛苦对齐的 CPU 版换成 PyPI 上的不配套版本
+  # —— 实测被换成 torchaudio 2.11.0，与 torch 2.9.1 不匹配，原生库直接加载失败。
+  # 它们真正缺的纯 Python 依赖下面单独装。
+  python3 -m pip install --break-system-packages -q $PYPI --no-deps \
     "demucs==4.0.1" dora-search einops julius lameenc openunmix pyyaml tqdm
 fi
 
@@ -75,6 +87,19 @@ fi
 if ! need soundfile; then
   echo "③.5 装 soundfile（demucs 的读写层，bgm-id.py 策略4 直接用它）…"
   python3 -m pip install --break-system-packages -q $PYPI soundfile
+fi
+
+# ── 3.9 一致性检查：torch 与 torchaudio 必须同版本 ──────────────────────
+# 不同版本时 torchaudio 的原生库会加载失败，而且失败信息很隐晦
+# （只报 "Could not load this library: .../lib/_torchaudio*.so"）。
+TV=$(python3 -c "import torch;print(torch.__version__.split('+')[0])" 2>/dev/null)
+AV2=$(python3 -c "import torchaudio;print(torchaudio.__version__.split('+')[0])" 2>/dev/null)
+if [ -n "$TV" ] && [ -n "$AV2" ] && [ "$TV" != "$AV2" ]; then
+  echo "✗ torch ($TV) 与 torchaudio ($AV2) 版本不一致 —— 原生库会加载失败。"
+  echo "  多半是某步装依赖时被换掉了。删掉重来："
+  echo "    python3 -m pip uninstall -y --break-system-packages torch torchaudio"
+  echo "    bash $0"
+  exit 1
 fi
 
 # ── 4. 验证 ────────────────────────────────────────────────────────────

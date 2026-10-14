@@ -118,6 +118,29 @@ bash <skill>/install-demucs.sh         # 见坑#15~17，脚本已固化正确路
 
 ---
 
+## 四·补、干净环境重装的实测（2026-10-14）
+
+为验证「新机器能不能照着装起来」，把 torch/torchaudio/demucs/soundfile 全卸掉重跑了一遍。
+**抓到 3 个真 bug**（前两个已修）：
+
+1. **装 demucs 时没加 `--no-deps`** —— demucs 与 openunmix 都声明了 torch/torchaudio 依赖，
+   放开解析后 pip 把刚对齐好的 **torchaudio 2.9.1 换成了 PyPI 上的 2.11.0**。
+   结果是 `torch 2.9.1` + `torchaudio 2.11.0` 不配套，torchaudio 的原生库加载失败，
+   报错还很隐晦（`Could not load this library: .../lib/_torchaudio*.so`）。
+   → **已修**：第③步加 `--no-deps`。
+2. **版本锁定的回退分支会装出不配套的组合** —— 找不到锁定版本时脚本回退到"最新"，
+   而"最新"恰恰是不配套的那个。→ **已修**：加 torch/torchaudio 版本一致性检查，
+   不一致就明确报错并给出重装命令。
+3. **`pip uninstall` 同样需要 `--break-system-packages`**（PEP 668 对装卸一视同仁），
+   否则回滚时会直接报 `externally-managed-environment` 退出。→ 已写进脚本注释。
+
+另外两条是环境特性，不是脚本缺陷，但影响体验：
+
+- **torch 解包极慢**：proot 容器里每个系统调用都被拦截，torch 有 1.3 万个文件，
+  实测解包 **10 分钟以上**（看起来像卡死，实际在推进）。
+- **内存吃紧时会 Bus error**：实测可用内存掉到 ~300MB 且另有构建任务在跑时，
+  pip 解包过程中 SIGBUS 崩溃（`set -e` 会正确中止脚本）。跑之前建议留 3GB 以上可用内存。
+
 ## 五、环境要求
 
 - Ubuntu 24.04 aarch64（或同类 ARM64 Linux 容器）
