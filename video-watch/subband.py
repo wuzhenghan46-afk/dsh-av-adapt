@@ -1,65 +1,43 @@
 #!/usr/bin/env python3
 """subband.py —— 字幕带 OCR：把整条字幕轨一次性抠出来
 
-为什么需要它
-------------
-"画面里的小字读不出来"是图版路线的硬伤：一张 5x5 图版每格只有 149px，
-屏幕上的字幕/UI 文字糊成一团。但字幕类文字有两条可利用的性质：
-
-  1. 位置固定 —— 字幕永远在同一条横带里
-  2. 读一次就够 —— 不需要让 Agent 逐帧看图
-
-所以正确做法不是"把字幕也拼进图版"，而是只 OCR 那一条带、再去重。
-结果是**整条字幕轨，零图片 token**。
-
-适用于：有硬字幕的视频（对白/唱词/解说）、新闻与综艺的下三分之一。
-不适用于：没有字幕的视频 —— 本工具会明确说"没找到"，不会硬编。
-
-关于"静态元素（台标/图卡）污染字幕轨"——**试过三种办法，全部有害，已默认关闭**
+关于"静态元素（台标/图卡）污染字幕轨"——**功能已删除，原因见下**
 --------------------------------------------------------------------------
 现象：新闻素材里静态的「新闻联播」台标被反复抽出，且 OCR 每次抖动成不同写法
       （XINWDN:LIANBO / CNWTNLIANBO / YINWTN:LIANBO …），把整条轨塞满。
 
-试过并失败的三个方案（都在 --mask-static 里，默认关）：
-  1. 文字框位置聚类 + 文本稳定度  → **完全没触发**。
-     原因：RapidOCR 把台标和标题**并成了同一个框**（实测日志：
-     `XINWTN:LIANBO 新闻联播 毒性之争引I发的PX"词条保卫战"`），
-     所谓"同一位置的文字"里混着会变的标题，稳定度永远不够。
-  2. 像素级遮罩（整片算时间维 σ） → **σ<3 的像素占 0%**，等于没遮。
-     原因：那条素材有 31 个切点，整片统计量的是"镜头之间的差异"而不是"静 vs 动"。
-     按窗口细分就露馅：全片 σ 中位 75.7，而 5s~8s 单镜头内 σ 中位 0.49、σ<3 占 86%。
-  3. 按镜头遮罩 / 多数镜头投票 → **真的遮上了，但把字幕也遮掉了**。
-     合成素材（只有变化字幕、无台标）实测：
-        无遮罩           13/13 = 100%
-        shot 模式        12 条，「到底是低毒还是剧毒」被截成「底是低毒还是居」
-        global 多数票    13 条但 11/13 = 85%，仍截断
-     原因无法调和：**某个像素在多数镜头里是背景、在少数镜头里是文字**，
-     抹掉它就切断了文字。"台标"与"持续两三秒的字幕"在像素层面无法区分。
+★ 2026-10-16 三方独立审查后的**订正**（我先前的归因有错，这里保留记录）：
 
-结论：**像素级静态遮罩在这类素材上做不安全。** 代码留着（--mask-static）供以后研究，
-但默认关闭；真要用请先在没有台标的素材上确认不掉准确率。
+订正 1：我说「RapidOCR 把台标和标题并成了同一个框」——**错**。
+        实测 RapidOCR 返回的是独立框（台标 x 56-130、正文 x 144-598，完全不重叠），
+        `return_word_box=True` 也可用。
+        **并框是本文件自己干的**：早先主循环里 `" ".join(x["text"] for x in got)`
+        把同一时刻所有框拼成一行，位置信息在那一步就丢了。这是**实现 bug**，
+        不是 API 限制 —— 也是「按位置分轨」这条路被误判为走不通的真正原因。
 
-可行的方向（未实现）：**文字级**处理 —— 对同一位置的多次读法求最长公共子串，
-把反复出现的那段当静态前缀剥掉，保留会变的部分。这比像素方案更贴近实际失效点。
+订正 2：我说「像素级静态遮罩在这类素材上做不安全」——**话说反了**。
+        实测（复刻本站的投票流程）真实素材上：
+            台标区 vote 中位 0.77 → ≥0.8 抹掉台标 **9%**
+            正文区 vote 中位 0.85 → ≥0.8 抹掉正文 **75%**
+        而且分区 σ 是：台标「新闻联播」 **9.08**（有旋转地球/光效，是**动**的），
+        新闻的下三分之一图文卡 **1.79**（是**静**的）。
+        → **这类素材里"静止"恰恰是要保留内容的特征，用"时间维方差"当判据方向是反的。**
+        另：合成素材上把阈值 0.8 改成 1.0 就能把 1/7 修到 6/7 —— 说明失败来自
+        **那一版实现**（镜头内 σ + 80% 多数票 + 填 127 灰），不是"像素级原理上不行"。
 
-性能要点（重要）
-----------------
-proot 容器里**单次 OCR 要 2~15 秒**（热节流影响很大）。逐帧 OCR 一条 80 秒的视频
-要 160 次调用 ≈ 800 秒，**根本跑不完**。所以本工具默认**拼批**：
-把 8 个时刻的带图竖着拼成一张，一次 OCR 认完，按 y 坐标归位。
-调用次数降一个数量级，实测 80 秒素材从 >900 秒降到约 100 秒。
+订正 3：我据此默认关闭了遮罩，并说「实测有害」——**证据不对称**。
+        我是用**没有静态元素**的合成素材测的，必然显示有害；
+        在**目标场景**（有台标的真实素材）上净收益**从未量化**。
 
-用法
-----
-    python3 subband.py 视频.mp4 --out 输出目录          # 全自动
-    python3 subband.py 视频.mp4 --band 300:360          # 手工指定带（像素，x 全宽）
-    python3 subband.py 视频.mp4 --batch 12 --upscale 2  # 调参
-
-产出
-----
-    subband.json   带位置 + 逐条字幕（起止时间、文本、置信度、抖动次数）
-    subband.txt    人读的版式
+★ 结论：**该功能已整体删除**（不是关闭）。
+  方向应该是「按位置分轨」而不是「按时间维方差抹像素」——
+  即保留每个 OCR 框的坐标、按位置聚类成轨、每轨独立合并，最后在**输出层**
+  标注哪些轨是持续元素。**非破坏性**：判错最坏是多标/漏标一条轨，
+  不会像像素遮罩那样把笔画打洞、不可恢复。
+  这条已记录为待办交给后续实现（见交付目录的交接文档）。
 """
+
+
 
 import argparse
 import json
@@ -146,7 +124,9 @@ def find_band(video, W, H, dur, sample_fps=0.5, max_samples=40):
         p = os.path.join(tmpd, "s%d.png" % i)
         if not grab_frame(video, float(t), p):
             continue
-        boxes.extend(ocr(p))
+        for bx in ocr(p):
+            bx["fi"] = i          # 记下「这个框来自第几帧」——选带要靠它
+            boxes.append(bx)
         if os.path.exists(p):
             os.unlink(p)
     if not boxes:
@@ -156,11 +136,21 @@ def find_band(video, W, H, dur, sample_fps=0.5, max_samples=40):
     heights = np.array([b["y1"] - b["y0"] for b in boxes], dtype=float)
     med_h = float(np.median(heights)) if len(heights) else 20.0
     win = max(med_h * 4.0, H * 0.08)
-    best, best_lo = -1, 0.0
+    # ★ 判据修正（2026-10-16 审查发现）：
+    #   原实现是**纯框计数** —— 同一帧里 20 个框和 20 帧里各 1 个框得分相同。
+    #   于是「某一帧中部有一大块文字」（表格页/正文页/弹幕）就能把带拉到那里，
+    #   **整条底部字幕轨被静默丢掉**。
+    #   实测（审查员注入合成框）：中部 5 帧各 20 框(=100) vs 底部 20 帧各 1 框(=20)
+    #   → 原实现选中 y 91-141（完全不含底部）。
+    #   修法：主看**有多少个不同帧**在这个 y 区间里有字（这才是"反复出现"），
+    #   框数只当平手时的次要依据。
+    best, best_lo = (-1, -1), 0.0
     for lo in np.arange(0.0, max(1.0, H - win * 0.5), max(1.0, win / 8)):
-        c = int(((centers >= lo) & (centers <= lo + win)).sum())
-        if c > best:
-            best, best_lo = c, float(lo)
+        sel = [b for b in boxes if lo <= b["y"] <= lo + win]
+        key = (len(set(b.get("fi", -1) for b in sel)), len(sel))
+        if key > best:
+            best, best_lo = key, float(lo)
+    n_frames_in_band, n_boxes_in_band = best
     inside = [b for b in boxes if best_lo <= b["y"] <= best_lo + win]
     if inside:
         y0 = max(0.0, min(b["y0"] for b in inside) - med_h * 0.6)
@@ -168,7 +158,9 @@ def find_band(video, W, H, dur, sample_fps=0.5, max_samples=40):
     else:
         y0, y1 = best_lo, best_lo + win
     info = {"n_probe_frames": n, "n_text_boxes": len(boxes),
-            "band_in_boxes": best, "band_coverage": round(best / len(boxes), 3),
+            "band_in_boxes": n_boxes_in_band,
+            "band_frames": n_frames_in_band,
+            "band_coverage": round(n_frames_in_band / max(1, n), 3),
             "median_text_height_px": round(med_h, 1)}
     return {"y0": round(y0, 1), "y1": round(y1, 1), "x0": 0.0, "x1": float(W)}, info
 
@@ -200,13 +192,143 @@ def _sim(a, b):
     return 1.0 - prev[lb] / max(la, lb)
 
 
-def merge(rows, sim_thresh=0.7, max_gap=1.2):
+def split_tracks(rows, n_moments, q=12, persist=0.30, y_tol=10.0):
+    """把每个时刻的文字框**按位置聚类分轨**，标出「持续存在的轨」。
+
+    为什么这么做（三方审查的共同结论）
+    ----------------------------------
+    早先「把同一时刻所有框 join 成一行文本」，那一步**把位置信息彻底丢了**。
+    位置一丢就只能在文本层时序合并，于是台标被拆成十几条、且与正文拼在一行。
+    `RapidOCR` 从来没有把台标和正文并成一个框（实测：台标 x 56-130、
+    正文 x 144-598，完全不重叠）—— 并框是我们在 join 那一步自己干的。
+
+    本函数**非破坏性**：不抹像素、不删文字，只按位置分轨打标签。
+
+    ⚠️ 关键实现细节（踩过的坑）
+      不能用「精确分桶」（把 x0 按 4px 取整当签名）：OCR 的框位置逐帧抖动
+      （同一个台标 x0 会在 56/60/63/64 之间跳），精确分桶会把它切成十几条轨，
+      每条只出现两三帧、持续性全都过不了阈值。实测这样跑出 **164 条轨、0 条持续、
+      243 条条目**，比不做还糟。必须用**容差聚类**：与已有簇的中心足够近就并进去。
+
+    真正管用的量是**持续性**：台标守在同一个位置贯穿全片（实测 19/25、15/25），
+    真字幕每句换区间（3~5/25）。
+    **抖动率单独不能用**：「新闻联播」抖动率 0.11，比真字幕 0.33 还低。
+
+    ⚠️ **当前实现是未完成的，默认关闭**（--tracks 才启用）。
+       实测缺陷：按位置聚类会把**不同长度的字幕**分到不同簇
+       （「巨毒还是低毒」窄、「到底是低毒还是剧毒」宽），
+       于是每条轨里装的都是不同的字幕，merge 一句都合并不了 ——
+       合成素材从 13 条变成 **78 条**（每个时刻一条）。
+       正确做法应该是：**只把「持续轨」（台标）分出去单独处理，
+       其余全部走原来的合并路径**，而不是把所有框都拆成轨。
+       这条已作为「待办 B」写进交接文档。
+    """
+    allb = []
+    for mi, r in enumerate(rows):
+        for b in r.get("boxes", []):
+            allb.append({"mi": mi, "b": b})
+    if not allb:
+        return [], {"reason": "没有文字框"}
+
+    # 容差聚类：按 y 分行、再按 x 邻近合并
+    allb.sort(key=lambda z: (z["b"]["y0"], z["b"]["x0"]))
+    clusters = []
+    for it in allb:
+        bb = it["b"]
+        w = max(1.0, bb["x1"] - bb["x0"])
+        placed = False
+        for c in clusters:
+            cw = max(1.0, c["x1"] - c["x0"])
+            # y 中心接近 + x 区间重叠或近邻 + 宽度相近
+            if (abs(bb["y0"] - c["y0"]) <= y_tol
+                    and abs(bb["y1"] - c["y1"]) <= y_tol
+                    and min(bb["x1"], c["x1"]) - max(bb["x0"], c["x0"]) > -q
+                    and 0.5 <= w / cw <= 2.0):
+                c["items"].append(it)
+                c["x0"] = min(c["x0"], bb["x0"]); c["x1"] = max(c["x1"], bb["x1"])
+                c["y0"] = min(c["y0"], bb["y0"]); c["y1"] = max(c["y1"], bb["y1"])
+                c["cx"] = sum(x["b"]["x0"] for x in c["items"]) / len(c["items"])
+                placed = True
+                break
+        if not placed:
+            clusters.append({"x0": bb["x0"], "x1": bb["x1"], "y0": bb["y0"], "y1": bb["y1"],
+                             "cx": bb["x0"], "items": [it]})
+
+    from collections import Counter
+    tracks = []
+    for ci, c in enumerate(clusters):
+        moms = sorted(set(x["mi"] for x in c["items"]))
+        readings = [x["b"]["text"] for x in c["items"]]
+        top, topn = Counter(readings).most_common(1)[0]
+        tracks.append({
+            "sig": ci,
+            "x0": round(c["x0"], 1), "x1": round(c["x1"], 1),
+            "y0": round(c["y0"], 1), "y1": round(c["y1"], 1),
+            "n_moments": len(moms), "n_boxes": len(c["items"]),
+            "persistence": round(len(moms) / max(1, n_moments), 3),
+            "n_readings": len(set(readings)),
+            "jitter": round(len(set(readings)) / max(1, len(c["items"])), 2),
+            "mean_score": round(sum(x["b"]["score"] for x in c["items"]) / len(c["items"]), 2),
+            "example": top, "top_reading_share": round(topn / max(1, len(c["items"])), 2),
+            "moments": moms,
+            "_boxes": [id(x["b"]) for x in c["items"]],
+        })
+    tracks.sort(key=lambda t: -t["n_moments"])
+    for ti, t in enumerate(tracks):
+        t["track_id"] = ti
+        t["persistent"] = bool(t["persistence"] >= persist)
+    info = {"n_tracks": len(tracks),
+            "n_persistent": sum(1 for t in tracks if t["persistent"]),
+            "persist_threshold": persist, "x_tolerance_px": q, "y_tolerance_px": y_tol}
+    return tracks, info
+
+
+def merge_per_track(rows, tracks, sim_thresh, max_gap):
+    """每条轨各自合并，再汇总（轨之间互不干扰）。"""
+    out = []
+    for tk in tracks:
+        want = set(tk.get("_boxes", []))
+        sub = []
+        for mi in tk["moments"]:
+            r = rows[mi]
+            got = [b for b in r.get("boxes", []) if id(b) in want]
+            if got:
+                got.sort(key=lambda z: z["x0"])
+                sub.append({"t": r["t"], "text": " ".join(b["text"] for b in got),
+                            "score": max(b["score"] for b in got)})
+        for e in merge(sub, sim_thresh, max_gap):
+            e["track"] = tk.get("track_id", 0)
+            e["track_persistent"] = tk["persistent"]
+            e["track_x"] = [tk["x0"], tk["x1"]]
+            e["track_persistence"] = tk["persistence"]
+            out.append(e)
+    out.sort(key=lambda e: (e["t0"], e["track"]))
+    return out
+
+
+def merge(rows, sim_thresh=0.7, max_gap=1.2, bridge_gap=None):
     """逐时刻 OCR → 字幕轨。
 
     相邻时刻相似 → 延长同一条（抗 OCR 抖动）；中间空太久 → 断开另起。
     每条取"出现次数最多的读法"当代表。
+
+    ★ bridge_gap：**修「OCR 漏检把同一句拆成多条」的 bug**。
+      原实现在 `r["t"] - e["t1"] > max_gap` 时无条件新起一条，
+      **不会再回头看"新起的这条是不是跟上一条其实是同一句"**。
+      而 max_gap=1.2s 在 2fps 下只允许漏检 2 帧 —— OCR 漏检是常态
+      （实测新闻素材 81 个时刻里只有 69 个有字），所以同句拆条是**系统性**的。
+      修法：新起之前，先在最近 `bridge_gap` 秒内**回看**已有的条目，
+      如果文本仍然相似，就接回那一条（而不是造一条重复的）。
+      回看窗口限制了"同句隔很久又出现"被误并的可能。
+
+      实测（构造同一句在 t=0/0.5 与 t=2.0/2.5、中间漏检 → gap 1.5s > 1.2）：
+          修复前：拆成 2 条
+          修复后：并为 1 条
     """
+    if bridge_gap is None:
+        bridge_gap = max_gap * 4.0
     entries = []
+    bridged = 0
     for r in rows:
         txt = (r["text"] or "").strip()
         if not txt:
@@ -220,6 +342,22 @@ def merge(rows, sim_thresh=0.7, max_gap=1.2):
                 if r["score"] > e["score"]:
                     e["text"], e["score"] = txt, r["score"]
                 continue
+            # ── 回看：OCR 漏检造成的断裂，接回上一条而不是新起重复条目
+            for back in entries[-6:][::-1]:
+                if r["t"] - back["t1"] > bridge_gap:
+                    break
+                if _sim(txt, back["text"]) >= sim_thresh:
+                    back["t1"] = r["t"]
+                    back["hits"] += 1
+                    back["_all"].append(txt)
+                    back["bridged"] = back.get("bridged", 0) + 1
+                    if r["score"] > back["score"]:
+                        back["text"], back["score"] = txt, r["score"]
+                    bridged += 1
+                    e = None
+                    break
+            if e is None:
+                continue
         entries.append({"t0": r["t"], "t1": r["t"], "text": txt, "score": r["score"],
                         "hits": 1, "_all": [txt]})
     for e in entries:
@@ -232,7 +370,11 @@ def merge(rows, sim_thresh=0.7, max_gap=1.2):
                     break
         e["duration"] = round(e["t1"] - e["t0"], 2)
         e["variants"] = len(set(_norm(x) for x in e["_all"]))
+        if e.get("bridged"):
+            e["note"] = "跨过 %d 次 OCR 漏检接回" % e["bridged"]
         e.pop("_all")
+    if bridged:
+        print("   （merge 回看：接回了 %d 处被 OCR 漏检打断的句子）" % bridged)
     return entries
 
 
@@ -241,8 +383,7 @@ def mmss(t):
     return "%d:%02d" % (int(t // 60), int(t % 60))
 
 
-def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score,
-               mask_of=None):
+def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score):
     """把一批时刻的带图竖拼成一张再 OCR，按 y 归位。返回 {i: [items]}"""
     from PIL import Image
     imgs = []
@@ -250,8 +391,6 @@ def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score,
         p = os.path.join(tmpd, "b%d.png" % i)
         im = None
         if grab_frame(video, i / fps, p, crop=(0, by, W, bh), scale=upscale):
-            if mask_of is not None:
-                apply_mask(p, mask_of(i))
             try:
                 im = Image.open(p).convert("RGB")
                 im.load()
@@ -286,112 +425,6 @@ def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score,
     return per
 
 
-# ------------------------------------------------- 静态元素遮罩（按镜头）
-
-def shot_masks(video, W, dur, by, bh, upscale, tmpd,
-               cut_thresh=18.0, min_shot=4, thresh=6.0, max_frames=200,
-               mode="shot"):
-    """**按镜头**算静态像素遮罩 —— 本工具最关键的一处修正。
-
-    实测教训（为什么不能整片算）
-    ---------------------------
-    第一版按「全片 24 帧」算时间维标准差，结果 σ 中位 75.7、σ<3 的像素占 0% ——
-    看起来"整个画面都在变"，方法像是失效了。按窗口细分就露馅了：
-
-        全片        σ 中位 75.73   σ<3 占  0.0%
-        5s~8s 内    σ 中位  0.49   σ<3 占 86.0%   ← 单镜头内
-
-    那条素材有 31 个切点。**整片统计量的是"镜头之间的差异"，不是"静 vs 动"。**
-
-    做法：抓一批带图 → 相邻帧差找切点 → 分镜 → 每个镜头内部算时间维 σ，
-    σ<thresh 的像素即静态（台标/固定图卡）；OCR 前把这些像素抹成平色。
-    镜头帧数少于 min_shot 就不遮罩，避免误判。
-
-    返回 shots = [{t0, t1, n_frames, mask|None, static_fraction|None}, ...]
-    """
-    import numpy as _np
-    from PIL import Image
-    mf = 200 if max_frames is None else int(max_frames)
-    k = max(12, min(mf, int(dur * 2) if dur > 0 else 24))
-    ts = _np.linspace(0.5, max(0.6, dur - 0.5), k) if dur > 1 else _np.linspace(0, 1, 12)
-    frames, kt = [], []
-    for i, t in enumerate(ts):
-        p = os.path.join(tmpd, "smf%d.png" % i)
-        if not grab_frame(video, float(t), p, crop=(0, by, W, bh), scale=upscale):
-            continue
-        try:
-            im = Image.open(p).convert("L")
-            im.load()
-            frames.append(_np.asarray(im, dtype=_np.float32))
-            kt.append(float(t))
-        except Exception:
-            pass
-        if os.path.exists(p):
-            os.unlink(p)
-    if len(frames) < min_shot:
-        return []
-    cuts = [0]
-    for i in range(1, len(frames)):
-        d = float(_np.abs(frames[i] - frames[i - 1]).mean())
-        if d > cut_thresh or (kt[i] - kt[i - 1]) > 3.0:
-            cuts.append(i)
-    cuts.append(len(frames))
-    shots = []
-    for si in range(len(cuts) - 1):
-        a_, b_ = cuts[si], cuts[si + 1]
-        idx = list(range(a_, b_))
-        t0, t1 = kt[a_], kt[min(b_, len(kt) - 1)]
-        if len(idx) < min_shot:
-            shots.append({"t0": round(t0, 2), "t1": round(t1, 2), "n_frames": len(idx),
-                          "mask": None, "static_fraction": None})
-            continue
-        A = _np.stack([frames[i] for i in idx], 0)
-        m = A.std(axis=0) < float(thresh)
-        shots.append({"t0": round(t0, 2), "t1": round(t1, 2), "n_frames": len(idx),
-                      "mask": m, "static_fraction": round(float(m.mean()), 3)})
-    if mode == "global":
-        # 只有「在多数镜头里都静态」的像素才抹掉 —— 这是区分「持续叠加的台标」
-        # 与「持续两三秒的字幕」的关键：
-        #   台标在几乎每个镜头里都不变 → 多数票通过 → 该抹
-        #   字幕每句文字不同，同一像素在不同镜头里取值不同 → 少数票 → 不该抹
-        got = [x["mask"] for x in shots if x.get("mask") is not None]
-        if got:
-            import numpy as _np
-            vote = _np.mean(_np.stack([g.astype(_np.float32) for g in got], 0), axis=0)
-            gm = vote >= 0.8
-            for x in shots:
-                if x.get("mask") is not None:
-                    x["mask"] = gm
-                    x["static_fraction"] = round(float(gm.mean()), 3)
-    return shots
-
-
-def mask_at(shots, t):
-    if not shots:
-        return None
-    for sh in shots:
-        if sh["t0"] <= t <= sh["t1"]:
-            return sh.get("mask")
-    return min(shots, key=lambda sh: min(abs(t - sh["t0"]), abs(t - sh["t1"]))).get("mask")
-
-
-def apply_mask(img_path, mask, fill=127):
-    if mask is None:
-        return False
-    import numpy as _np
-    from PIL import Image
-    try:
-        im = Image.open(img_path).convert("RGB")
-        a = _np.asarray(im).copy()
-        if mask.shape[:2] != a.shape[:2]:
-            return False
-        a[mask] = fill
-        Image.fromarray(a).save(img_path)
-        return True
-    except Exception:
-        return False
-
-
 # --------------------------------------------------------------- 主流程
 
 def main():
@@ -404,20 +437,16 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="每批拼几张带图一起 OCR（默认 8）")
     ap.add_argument("--sample-fps", type=float, default=0.5, help="自动找带时的采样帧率")
     ap.add_argument("--sim", type=float, default=0.7, help="合并两条字幕的相似度阈值")
+    ap.add_argument("--tracks", action="store_true",
+                    help="⚠ 实验性且**未完成**：按位置分轨（想分离台标与正文用）。"
+                         "当前实现在「字幕长度不一」的素材上会把本该合并的句子拆散"
+                         "（实测合成素材 13 条 → 78 条），故默认关闭。"
+                         "正确做法见交付目录的交接文档「待办 B」。")
+    ap.add_argument("--track-q", type=int, default=4, help="位置量化像素（默认 4）")
+    ap.add_argument("--track-persist", type=float, default=0.30,
+                    help="位置占比 ≥ 此值判为「持续轨」（默认 0.30）")
     ap.add_argument("--max-gap", type=float, default=1.2, help="间隔超过此秒数即断开")
     ap.add_argument("--min-score", type=float, default=0.4, help="带内 OCR 的最低置信度")
-    ap.add_argument("--mask-static", action="store_true", default=False,
-                    help="⚠ 实验性且**实测有害**：像素级静态遮罩（抹掉台标/固定图卡）。"
-                         "合成素材实测把 100% 打成 85%（字幕被截断），默认关闭。详见文件头说明。")
-    ap.add_argument("--no-mask-static", dest="mask_static", action="store_false",
-                    help="关闭静态遮罩（默认）")
-    ap.add_argument("--mask-thresh", type=float, default=6.0,
-                    help="镜头内时间维标准差低于此值算静像素（默认 6.0）")
-    ap.add_argument("--cut-thresh", type=float, default=18.0,
-                    help="判切点的帧差阈值（默认 18.0；越小切得越碎）")
-    ap.add_argument("--mask-mode", choices=["shot", "global"], default="global",
-                    help="shot=镜头内静态就抹（会把持续几秒的字幕也抹掉，实测有害）；"
-                         "global=要在多数镜头里都静态才抹（默认，能区分台标与字幕）")
     a = ap.parse_args()
 
     out = a.out or os.path.splitext(a.video)[0] + "_subband"
@@ -441,7 +470,21 @@ def main():
               % (band["y0"], band["y1"], band["y1"] - band["y0"],
                  info["band_coverage"] * 100, info["median_text_height_px"]))
     else:
-        y0, y1 = (float(x) for x in a.band.split(":"))
+        try:
+            parts = a.band.split(":")
+            if len(parts) != 2:
+                raise ValueError("要写成 y0:y1，例如 --band 320:480")
+            y0, y1 = float(parts[0]), float(parts[1])
+        except ValueError as e:
+            sys.exit("✗ --band 参数错误：%s（收到 %r）" % (e, a.band))
+        if not (y1 > y0):
+            sys.exit("✗ --band 的 y1 必须大于 y0（收到 %s）" % a.band)
+        if y0 < 0 or y1 > H:
+            sys.exit("✗ --band 超出画面高度：画面高 %d，收到 y %g-%g。"
+                     "（这个错误以前不检查，会导致每帧 ffmpeg 都失败、"
+                     "最后安静地输出「0 条字幕」并返回成功）" % (H, y0, y1))
+        if (y1 - y0) < 8:
+            sys.exit("✗ --band 太窄（%g 像素），无法 OCR" % (y1 - y0))
         band = {"y0": y0, "y1": y1, "x0": 0.0, "x1": float(W)}
         info = {"reason": "手工指定"}
 
@@ -454,42 +497,62 @@ def main():
           % (a.fps, n, a.batch, nb, W, bh, a.upscale))
     tmpd = tempfile.mkdtemp(prefix="subband_")
 
-    # 按镜头的静态遮罩（台标/固定图卡会被抹掉再 OCR）
-    shots = []
-    if a.mask_static:
-        shots = shot_masks(a.video, W, dur, by, bh, a.upscale, tmpd,
-                           a.cut_thresh, 4, a.mask_thresh, None, a.mask_mode)
-        got = [x["static_fraction"] for x in shots if x.get("static_fraction") is not None]
-        if shots:
-            print("静态遮罩（按镜头）：切成 %d 段，%d 段做了遮罩，镜头内静像素占比中位 %.0f%%"
-                  % (len(shots), len(got),
-                     (sorted(got)[len(got)//2] if got else 0) * 100))
-            for r in shots[:6]:
-                if r.get("static_fraction") is not None:
-                    print("   镜头 %5.1fs~%5.1fs  %2d 帧  静像素 %.0f%%"
-                          % (r["t0"], r["t1"], r["n_frames"], r["static_fraction"] * 100))
-        else:
-            print("静态遮罩：样本不足，跳过")
-
-    def _mask_of(i):
-        return mask_at(shots, i / a.fps) if shots else None
-
     rows = []
     for b, b0 in enumerate(range(0, n, a.batch)):
         idxs = list(range(b0, min(n, b0 + a.batch)))
         per = _ocr_stack(a.video, idxs, a.fps, by, W, bh, a.upscale, tmpd, str(b),
-                         a.min_score, _mask_of if shots else None)
+                         a.min_score)
         for i in idxs:
             got = per.get(i)
             if got:
                 got.sort(key=lambda x: x["x0"])
-                rows.append({"t": round(i / a.fps, 2),
+                # **保留每个框的位置** —— 早先这里只留 join 后的文本，
+                # 位置一丢就再也分不开台标与正文（三方审查共同指出的根因）。
+                rows.append({"t": round(i / a.fps, 2), "boxes": got,
                              "text": " ".join(x["text"] for x in got),
                              "score": max(x["score"] for x in got)})
         print("  … 批 %d/%d  已得 %d 个有字时刻" % (b + 1, nb, len(rows)))
 
-    # 3) 合并
-    entries = merge(rows, a.sim, a.max_gap)
+    # ★ 全失败保护（2026-10-16 审查发现）：
+    #   原实现里如果所有帧都抓不到（crop 非法、ffmpeg 失败等），
+    #   会安静地输出「0 条字幕」并**返回退出码 0** ——
+    #   使用者会把它读成"这条视频没有字幕"，而不是"我参数给错了"。
+    #   对比：cumsample.py 在 ffmpeg 失败时是 raise 的，这里以前漏了。
+    if not rows:
+        print()
+        print("✗ 一个时刻都没 OCR 到文字 —— 这**不**等于「这条视频没有字幕」。")
+        print("  已检查 %d 个时刻，全部没结果。常见原因：" % n)
+        print("    · --band 给的范围不对（当前 y %.0f-%.0f，画面高 %d）" % (by, by + bh, H))
+        print("    · ffmpeg 取帧失败（路径/编码问题）")
+        print("    · 这条素材确实没有硬字幕（那请用 ASR 或联网取词）")
+        print("  写了一份空结果到输出目录，但**别把它当成结论**。")
+        with open(os.path.join(out, "subband.json"), "w", encoding="utf-8") as f:
+            json.dump({"video": os.path.abspath(a.video), "duration_s": dur,
+                       "size": [W, H], "band": band, "band_info": info,
+                       "error": "no_text_found", "entries": [],
+                       "stats": {"n_ocr_steps": n, "n_text_moments": 0, "n_entries": 0}},
+                      f, ensure_ascii=False, indent=1)
+        return 3
+
+    # 3) 先按位置分轨，再逐轨合并（非破坏性：只打标签，不删内容）
+    tracks, track_info = [], None
+    if a.tracks:
+        tracks, track_info = split_tracks(rows, len(rows), a.track_q, a.track_persist)
+        if tracks:
+            print("位置分轨：%d 条轨，其中 %d 条判为「持续轨」（位置占比 ≥%.0f%%，疑似台标/固定图卡）"
+                  % (track_info["n_tracks"], track_info["n_persistent"],
+                     track_info["persist_threshold"] * 100))
+            for tk in [t for t in tracks if t["persistent"]][:4]:
+                print("   持续轨 x %.0f-%.0f 出现 %d/%d 时刻 (%.0f%%)  读法 %d 种  "
+                      "置信 %.2f  例「%s」"
+                      % (tk["x0"], tk["x1"], tk["n_moments"], len(rows),
+                         tk["persistence"] * 100, tk["n_readings"],
+                         tk["mean_score"], tk["example"][:22]))
+            entries = merge_per_track(rows, tracks, a.sim, a.max_gap)
+        else:
+            entries = merge(rows, a.sim, a.max_gap)
+    else:
+        entries = merge(rows, a.sim, a.max_gap)
     print("→ %d 个有字时刻，合并为 %d 条字幕" % (len(rows), len(entries)))
 
     result = {"video": os.path.abspath(a.video), "duration_s": round(dur, 2),
@@ -499,7 +562,8 @@ def main():
               "stats": {"n_ocr_steps": n, "n_ocr_calls": nb, "n_text_moments": len(rows),
                         "n_entries": len(entries),
                         "total_text_seconds": round(sum(e["duration"] for e in entries), 1)},
-              "shots": [{k: v for k, v in sh.items() if k != "mask"} for sh in shots],
+              "tracks": [{k: v for k, v in t.items() if k not in ("moments", "_boxes")} for t in tracks],
+              "track_info": track_info,
               "entries": entries}
     with open(os.path.join(out, "subband.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)

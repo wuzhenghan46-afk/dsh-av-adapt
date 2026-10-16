@@ -143,12 +143,29 @@ def select(M, fps, tau, max_n, skeleton):
         mind[i] = 0.0
         assign[i] = j
 
+    # τ 的合法性：τ<0 无意义；τ=0 曾导致死循环（见下），这里统一拦掉
+    if tau is None:
+        tau = 0.0
+    tau = float(tau)
+    if tau < 0:
+        raise ValueError("τ 不能为负数（当前 %.4f）；要「尽量多采」请用 --max 控预算" % tau)
+
+    skeleton_cut = False
     if skeleton and skeleton > 0:
         step = max(1, int(round(skeleton * fps)))
         for i in range(0, N, step):
+            # 骨架点也必须受总预算约束 —— 早先这里没有检查，
+            # --max 2 配 30s 骨架会照样吐出 4 个点（2026-10-16 实测复现）。
+            if len(sel) >= max_n:
+                skeleton_cut = True
+                break
             add(i, "skeleton")
     else:
         add(0, "first")
+
+    if skeleton_cut:
+        # 预算小到连骨架都放不下 —— 如实报告，不假装覆盖完整
+        return sel, reason, mind, assign, "max(skeleton)"
 
     stopped = "tau"
     while True:
@@ -156,7 +173,12 @@ def select(M, fps, tau, max_n, skeleton):
             stopped = "max"
             break
         i = int(np.argmax(mind))
-        if mind[i] < tau:
+        # 必须用 <= 而不是 < ：
+        # 终止条件原为 mind[i] < tau，当 tau=0 且所有帧完全相同（mind 全 0）时
+        # 「0 < 0」恒为假 → 永不退出，只能靠 max_n 兜住，
+        # 于是一直重复添加同一帧（实测 100 帧全同、max=8 → [0,30,60,90,0,0,0,0]）。
+        # 另外 mind[i] <= 0 意味着"这一帧已经被选过了"，也不该再选。
+        if mind[i] <= tau or mind[i] <= 0:
             break
         add(i, "novelty")
     return sel, reason, mind, assign, stopped
@@ -217,6 +239,15 @@ def analyze(video, fps=4.0, tau=None, max_n=200, skeleton=30.0, metric="global",
     blind_a = ([0.0] + times)[gi]
     blind_b = (times + [dur])[gi]
     pc = np.percentile(cons, [50, 90, 99]) if len(cons) else [0, 0, 0]
+    # 报告半径：盲区报告拿什么当尺子
+    if tau and tau > 0:
+        report_radius, report_radius_source = float(tau), "（= τ）"
+    else:
+        # 预算优先模式（τ=0）：τ 只表示"别停手"，不能拿来当覆盖尺子
+        report_radius = float(pc[1]) * AUTO_TAU_FACTOR
+        report_radius_source = ("（= 建议值 p90×%.2f = %.4f；"
+                                "**这是质量目标，不是算法约束** —— τ=0 表示本次以 --max 预算为准）"
+                                % (AUTO_TAU_FACTOR, report_radius))
     plan = {
         "video": os.path.abspath(video), "duration_s": round(dur, 2), "size": [W, H],
         "params": {"fps": fps, "tau": tau, "tau_source": tau_source, "max": max_n, "skeleton": skeleton,
@@ -227,7 +258,13 @@ def analyze(video, fps=4.0, tau=None, max_n=200, skeleton=30.0, metric="global",
             "n_novelty": reasons.count("novelty") + reasons.count("first"),
             "radius": round(float(mind.max()), 4), "mean_dist": round(float(mind.mean()), 4),
             "stopped_by": stopped,
-            "uncovered": [[a, b] for a, b in _runs(mind > tau, fps, merge_gap=2)],
+            # 盲区按「报告半径」判，而不是一律按 τ：
+            # τ=0（预算优先模式）下按 τ 判会把几乎整片算成盲区
+            # （实测：120 点、τ=0 → 报「326s 未被覆盖」，报告失去意义）。
+            # τ>0 时报告半径就是 τ；τ=0 时用建议值 p90×0.75 当**质量目标**。
+            "report_radius": round(float(report_radius), 4),
+            "report_radius_source": report_radius_source,
+            "uncovered": [[a, b] for a, b in _runs(mind > report_radius, fps, merge_gap=2)],
             "max_blind_gap_s": [round(float(gaps[gi]), 1), round(blind_a, 1), round(blind_b, 1)],
             "consecutive_dist_p50_p90_p99": [round(float(x), 4) for x in pc],
             "n_sheets": (len(sel) + cols * cols - 1) // (cols * cols),
@@ -262,13 +299,14 @@ def ledger_text(plan):
     L.append(f"采样  {c['n_samples']} 点（骨架 {c['n_skeleton']} + 新颖 {nov}，新颖占比 {nov_ratio:.0%}）   "
              f"{c['n_sheets']} 版 ≈ {c['est_tokens']} token   停止原因: "
              + ("覆盖半径<τ（相对 τ 已覆盖）" if c["stopped_by"] == "tau" else f"达到上限 --max={p['max']}（仍有盲区！）"))
-    L.append(f"覆盖  半径 {c['radius']}（τ={p['tau']}）   平均距离 {c['mean_dist']}")
+    L.append(f"覆盖  实际达到半径 {c['radius']}   平均距离 {c['mean_dist']}")
+    L.append(f"      盲区判据半径 {c.get('report_radius', p['tau'])}  {c.get('report_radius_source', '')}")
     if c["uncovered"]:
         tot = sum(b - a for a, b in c["uncovered"])
-        L.append(f"盲区  共 {tot:.0f}s 未被覆盖（距离>τ）：" + "  ".join(f"{mmss(a)}-{mmss(b)}" for a, b in c["uncovered"][:12])
+        L.append(f"盲区  共 {tot:.0f}s 超过判据半径：" + "  ".join(f"{mmss(a)}-{mmss(b)}" for a, b in c["uncovered"][:12])
                  + (" …" if len(c["uncovered"]) > 12 else ""))
     else:
-        L.append("盲区  相对 τ 无盲区（所有帧到最近采样点的距离 ≤ τ）")
+        L.append(f"盲区  相对判据半径 {c.get('report_radius', p['tau'])} 无盲区（所有帧到最近采样点的距离都 ≤ 它）")
     g, a, b = c["max_blind_gap_s"]
     L.append(f"时间  相邻采样点最大间隔 {g}s（{mmss(a)}-{mmss(b)}）")
 
@@ -276,13 +314,36 @@ def ledger_text(plan):
     # 教训：τ 过大时 k-center 会退化成「骨架的每 N 秒一帧」，却仍然报「无盲区」。
     L.append("")
     L.append("自检：")
-    if nov_ratio < 0.20:
-        L.append(f"  ⚠ τ 过大 —— 新颖点只占 {nov_ratio:.0%}（阈值 20%）。")
-        L.append(f"    k-center 几乎没起作用，输出基本等于骨架的「每 {p['skeleton']:.0f} 秒一帧」，")
-        L.append(f"    也就是它本来要取代的均匀采样。请把 τ 调小（从 {sug:.4f} 起试），或用 --max 当预算。")
+    # ★ 判据修正（2026-10-16 审查发现）：
+    #   原来只看**新颖占比**（比值）。但比值在「半失效区」会保持高位：
+    #     实测 τ=0.20 → 42 点 / 新颖 74%（看着健康），实际比 239 点掉了 5.7 倍；
+    #     实测 τ=0.24 → 15 点 / 新颖仅 4 个 / 1 版图版，自检**仍报「✓ 算法有效」**。
+    #   → 覆盖能力是**绝对量**问题，不是比值问题。补一条绝对量判据：
+    #     平均采样间隔超过 AVG_GAP_WARN 秒就告警。
+    #   实测各档平均间隔（MV 330s）：τ=0.10 → 0.8s；0.15 → 1.4s；auto → 1.25s；
+    #     0.20 → 7.9s；0.24 → 22s。取 5s 能提前抓住半失效，且默认 auto 远低于它。
+    AVG_GAP_WARN = 5.0
+    avg_gap = (dur / max(1, c["n_samples"])) if dur else 0.0
+    bad_ratio = nov_ratio < 0.20
+    bad_gap = avg_gap > AVG_GAP_WARN
+    if bad_ratio or bad_gap:
+        why = []
+        if bad_gap:
+            why.append(f"平均采样间隔 {avg_gap:.1f}s > {AVG_GAP_WARN:.0f}s")
+        if bad_ratio:
+            why.append(f"新颖点只占 {nov_ratio:.0%}（阈值 20%）")
+        L.append(f"  ⚠ 采样过疏（{'；'.join(why)}）")
+        if bad_ratio:
+            L.append(f"    k-center 几乎没起作用，输出基本等于骨架的「每 {p['skeleton']:.0f} 秒一帧」，")
+            L.append(f"    也就是它本来要取代的均匀采样。")
+        if bad_gap:
+            L.append(f"    全片 {mmss(dur)} 只取了 {c['n_samples']} 个点、{c['n_sheets']} 版图版 ——")
+            L.append(f"    这个密度不足以支撑「看懂了」的结论。")
+        L.append(f"    请把 τ 调小（从 {sug:.4f} 起试），或用 --max 指定预算。")
     else:
-        L.append(f"  ✓ 算法有效：新颖点占 {nov_ratio:.0%}，采样位置由内容变化驱动。")
-    if nov_ratio < 0.20 or c["stopped_by"] != "tau":
+        L.append(f"  ✓ 算法有效：新颖点占 {nov_ratio:.0%}，"
+                 f"平均采样间隔 {avg_gap:.1f}s，采样位置由内容变化驱动。")
+    if bad_ratio or bad_gap or c["stopped_by"] != "tau":
         L.append("  ⚠ 本次结论不可当作「看懂了」的证据 —— 覆盖度是相对 τ 自洽的，")
         L.append("    只说明「所有帧都能被某个采样点代表」，不说明信息没被漏掉。")
     L.append(f"  平均距离 {c['mean_dist']}（越小说明帧越贴近其代表点；随 τ 收紧而下降是正常的）")

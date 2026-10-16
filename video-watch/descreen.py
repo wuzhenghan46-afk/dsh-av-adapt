@@ -55,13 +55,62 @@ def grab(path, t, out, scale=1):
     return _run(cmd).returncode == 0 and os.path.exists(out)
 
 
-def order_quad(pts):
-    """把 4 个点排成 左上/右上/右下/左下。"""
+def order_quad(pts, strict=False):
+    """把 4 个点排成 左上/右上/右下/左下。
+
+    ★ 加上退化检查（2026-10-16 审查发现）：
+      原实现只用 argmin/argmax 取极值点，**不检查这 4 个索引是否互不相同**。
+      实测一个旋转 45° 的正方形 [(0,1),(1,0),(2,1),(1,2)] 会返回
+      [[0,1],[1,0],[2,1],[0,1]] —— 只有 **3 个唯一顶点**（TL 与 BL 重了）；
+      共线退化时只剩 2 个。用这种四点调 warp，**会返回成功却输出一张 99% 全黑的图**。
+      翻拍素材的四边形朝向任意，45° 附近完全可能触发。
+
+    strict=True 时，退化直接抛 ValueError（给 --corners 手工路径用）。
+    """
     p = np.array(pts, dtype=np.float32)
+    if p.shape != (4, 2):
+        raise ValueError("需要 4 个点，收到 %d 个" % len(p))
     s = p.sum(axis=1)
     d = np.diff(p, axis=1).ravel()
-    return np.array([p[np.argmin(s)], p[np.argmin(d)], p[np.argmax(s)], p[np.argmax(d)]],
-                    dtype=np.float32)
+    idx = [int(np.argmin(s)), int(np.argmin(d)), int(np.argmax(s)), int(np.argmax(d))]
+    uniq = len(set(idx))
+    if uniq < 4:
+        msg = ("四角退化：4 个极值索引只有 %d 个唯一顶点（顺序 %s）—— "
+               "很可能有共线或重合的点，校正出来的图会是黑图" % (uniq, idx))
+        if strict:
+            raise ValueError(msg)
+    return np.array([p[i] for i in idx], dtype=np.float32)
+
+
+def check_quad(quad):
+    """检查四角是否可用于透视校正。返回 (ok, 原因)。"""
+    q = np.asarray(quad, dtype=np.float32)
+    if q.shape != (4, 2):
+        return False, "需要 4 个点，收到 %d 个" % len(q)
+    # 唯一顶点（容差 2px）
+    uniq = []
+    for x, y in q:
+        if not any(abs(x - ux) < 2 and abs(y - uy) < 2 for ux, uy in uniq):
+            uniq.append((float(x), float(y)))
+    if len(uniq) < 4:
+        return False, "只有 %d 个不同的顶点（需要 4 个）—— 有重合点" % len(uniq)
+    # 面积：用鞋带公式
+    area = 0.0
+    for i in range(4):
+        x1, y1 = q[i]; x2, y2 = q[(i + 1) % 4]
+        area += x1 * y2 - x2 * y1
+    area = abs(area) / 2.0
+    if area < 64.0:
+        return False, "四角围出的面积只有 %.0f 平方像素 —— 近似共线" % area
+    # 凸性：四个叉积同号
+    signs = []
+    for i in range(4):
+        a, b, c = q[i], q[(i + 1) % 4], q[(i + 2) % 4]
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        signs.append(cross > 0)
+    if len(set(signs)) != 1:
+        return False, "四角不是凸四边形（叉积符号不一致）"
+    return True, "ok"
 
 
 def find_screen(img_path, min_area_frac=0.06, approx_lo=0.015, approx_hi=0.06):
@@ -113,6 +162,10 @@ def warp(img_path, quad, out_path):
     """按四角做透视校正，输出正向的屏幕图。"""
     import cv2
     img = cv2.imread(img_path)
+    ok, why = check_quad(np.asarray(quad, dtype=np.float32))
+    if not ok:
+        print("  ✗ 四角不可用：%s" % why)
+        return False
     q = order_quad(quad)
     wA = np.linalg.norm(q[1] - q[0]); wB = np.linalg.norm(q[2] - q[3])
     hA = np.linalg.norm(q[3] - q[0]); hB = np.linalg.norm(q[2] - q[1])
@@ -162,7 +215,15 @@ def main():
     # 1) 找四角
     quad = None
     if a.corners:
-        quad = np.array([[float(v) for v in p.split(",")] for p in a.corners.split()], dtype=np.float32)
+        try:
+            quad = np.array([[float(v) for v in p.split(",")] for p in a.corners.split()], dtype=np.float32)
+        except ValueError as e:
+            sys.exit("✗ --corners 格式错误：要写成 \"x1,y1 x2,y2 x3,y3 x4,y4\"（%s）" % e)
+        if quad.shape != (4, 2):
+            sys.exit("✗ --corners 需要正好 4 个点（收到 %d 个）" % len(quad))
+        ok, why = check_quad(quad)
+        if not ok:
+            sys.exit("✗ --corners 的四角不可用：%s" % why)
         print("四角：手工指定")
     else:
         quad, vis = find_screen(frame)

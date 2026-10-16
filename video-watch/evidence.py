@@ -35,11 +35,18 @@
 
 状态含义
 --------
-    已确认   至少两路「不同通道」的来源，且**全部可解析**
-    待核     只有一路来源，或两路同通道
-    推断     没有来源（这条会被 check 高亮，因为它最容易冒充事实）
-    有坏源   有来源但至少一个解析不了 —— 比「推断」更该警惕：
-             这说明你以为有依据，其实那个依据不存在
+    来源齐备   至少两路「不同通道」的**可核实**来源，且全部解析通过
+               ★ 注意：这只表示"来源给够了"，**不等于结论正确**
+    待核       只有一路可核实来源
+    待核(同通道) 两路都是同一通道（例如两次 OCR 读同一行）—— 不算两路独立
+    仅记录     只有 net/manual 这类记录性来源 —— 程序没核实过任何东西
+    推断       没有来源（check 会高亮，因为它最容易冒充事实）
+    有坏源     有来源但至少一个解析不了（含写错类型的）——
+               比「推断」更该警惕：你以为有依据，其实那个依据不存在
+
+    「可核实」= visual（sheet/read/frame）或 text（ocr/asr/subband）。
+    net 只是记了个网址（程序不会去访问），manual 只是人写的一句话，
+    **两者都不计入独立性**。
 """
 
 import argparse
@@ -54,6 +61,12 @@ FAMILY = {
     "ocr": "text", "asr": "text", "subband": "text",
     "net": "external", "manual": "manual",
 }
+
+# 哪些通道算「可核实」—— 只有这些才计入"独立性"。
+# net 只是记了个网址（程序不会去访问），manual 只是人写的一句话，
+# 两者都**不能**当独立证据用：早先把它们也算一路，导致
+# 「图版 + manual:看起来是对的」被判「已确认」（2026-10-16 实测复现）。
+VERIFIABLE = {"visual", "text"}
 
 
 def load(path):
@@ -119,10 +132,17 @@ def resolve(s):
             if os.path.exists(pj):
                 try:
                     d = json.load(open(pj, encoding="utf-8"))
-                    k = (s["sheet"] - 1) * 25 + s["row"] * 5 + s["col"]
-                    hit = [x for x in d.get("samples", []) if x.get("k") == k]
+                    # 直接按样本自带的 sheet/row/col 匹配 —— plan.json 的样本里
+                    # 本来就有这三个字段，根本不用算 k。
+                    # 早先自己算 `(sheet-1)*25 + row*5 + col`，而 plan.json 的 k 是
+                    # **从 1 开始**编的，于是第一格永远算成 0、查不到（实测复现）。
+                    hit = [x for x in d.get("samples", [])
+                           if x.get("sheet") == s["sheet"] and x.get("row") == s["row"]
+                           and x.get("col") == s["col"]]
                     if hit:
                         extra = "该格对应 t=%.1fs" % hit[0]["t"]
+                    else:
+                        extra = "**该格在 plan.json 里找不到对应样本**（行/列越界？）"
                 except Exception:
                     pass
             return True, "图版存在 " + pats[0] + ("，" + extra if extra else ""), extra
@@ -152,25 +172,45 @@ def resolve(s):
         if t == "net":
             return True, "外部来源（程序无法核实）：" + s.get("url", "")[:60], None
         if t == "manual":
-            return True, "人工观察：" + s.get("note", "")[:60], None
-        return True, "未知类型，原样记录", None
+            return True, "人工观察（**不计入独立性**）：" + s.get("note", "")[:50], None
+        # 未知/写错的来源**不能**当作已核实 —— 早先这里返回 True，
+        # 于是一串乱码也能把结论托成「已确认」（实测复现）。
+        return False, "无法识别的来源类型「%s」—— 请按 sheet:/ocr:/asr:/net:/manual: 写" % t, None
     except Exception as e:
         return False, "解析出错：%s: %s" % (type(e).__name__, e), None
 
 
 def status_of(sources):
-    """按「通道数」定状态，并把每个来源的解析结果带上。"""
-    parsed = [parse_src(x) for x in sources]
-    parsed = [p for p in parsed if p]
-    fams = set(p["family"] for p in parsed)
+    """判定状态。**严格区分四件事**（早先把它们混成一件，是设计错误）：
+
+        1. 来源「能被程序解析」吗（文件在不在、条号越界没）
+        2. 来源「算独立证据」吗（net/manual 不算 —— 程序没去核实过）
+        3. 有没有「两路不同通道」的可核实来源
+        4. **结论本身成不成立** —— 这一条本工具**无法判定**，
+           所以状态里绝不出现"已确认"这种话，只说"来源齐备"。
+
+    ★ 特别注意：`来源齐备` **不等于结论正确**。
+      它只说明"你给出的可核实来源够两路且都解析通过"。
+      来源内容是否真的支持这条结论，只能靠人或另一个模型复核。
+    """
+    parsed = [p for p in (parse_src(x) for x in sources) if p]
+    if not parsed:
+        return "推断", []
     results = [(p, *resolve(p)) for p in parsed]
     bad = [r for r in results if not r[1]]
-    if not parsed:
-        return "推断", results
     if bad:
         return "有坏源", results
+
+    verifiable = [p for p, _, _, _ in results if p["family"] in VERIFIABLE]
+    fams = set(p["family"] for p in verifiable)
+    if not verifiable:
+        # 只有 net/manual 这类记录性来源 —— 程序没核实过任何东西
+        return "仅记录", results
     if len(fams) >= 2:
-        return "已确认", results
+        return "来源齐备", results
+    if len(verifiable) >= 2:
+        # 两路都是同一通道（比如两次 OCR）—— 不算两路独立
+        return "待核(同通道)", results
     return "待核", results
 
 
@@ -211,7 +251,8 @@ def cmd_check(a):
 
 def cmd_show(a):
     d = load(a.ledger)
-    mark = {"已确认": "✓", "待核": "·", "推断": "?", "有坏源": "✗"}
+    mark = {"来源齐备": "✓", "待核": "·", "待核(同通道)": "·", "仅记录": "~",
+            "推断": "?", "有坏源": "✗"}
     print("账本  %s" % d.get("subject", ""))
     print("=" * 66)
     for c in d["claims"]:
@@ -225,6 +266,10 @@ def cmd_show(a):
     from collections import Counter
     cnt = Counter((c.get("status") or status_of(c["sources"])[0]) for c in d["claims"])
     print("   " + "  ".join("%s %d" % (k, v) for k, v in cnt.items()))
+    if cnt.get("来源齐备"):
+        print()
+        print("   注：`来源齐备` 只表示「可核实来源够两路且都解析通过」，")
+        print("       **不代表结论正确** —— 来源内容是否真的支持该结论，本工具判不了。")
 
 
 def main():
