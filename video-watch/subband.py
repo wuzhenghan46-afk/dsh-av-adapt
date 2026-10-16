@@ -15,6 +15,33 @@
 适用于：有硬字幕的视频（对白/唱词/解说）、新闻与综艺的下三分之一。
 不适用于：没有字幕的视频 —— 本工具会明确说"没找到"，不会硬编。
 
+关于"静态元素（台标/图卡）污染字幕轨"——**试过三种办法，全部有害，已默认关闭**
+--------------------------------------------------------------------------
+现象：新闻素材里静态的「新闻联播」台标被反复抽出，且 OCR 每次抖动成不同写法
+      （XINWDN:LIANBO / CNWTNLIANBO / YINWTN:LIANBO …），把整条轨塞满。
+
+试过并失败的三个方案（都在 --mask-static 里，默认关）：
+  1. 文字框位置聚类 + 文本稳定度  → **完全没触发**。
+     原因：RapidOCR 把台标和标题**并成了同一个框**（实测日志：
+     `XINWTN:LIANBO 新闻联播 毒性之争引I发的PX"词条保卫战"`），
+     所谓"同一位置的文字"里混着会变的标题，稳定度永远不够。
+  2. 像素级遮罩（整片算时间维 σ） → **σ<3 的像素占 0%**，等于没遮。
+     原因：那条素材有 31 个切点，整片统计量的是"镜头之间的差异"而不是"静 vs 动"。
+     按窗口细分就露馅：全片 σ 中位 75.7，而 5s~8s 单镜头内 σ 中位 0.49、σ<3 占 86%。
+  3. 按镜头遮罩 / 多数镜头投票 → **真的遮上了，但把字幕也遮掉了**。
+     合成素材（只有变化字幕、无台标）实测：
+        无遮罩           13/13 = 100%
+        shot 模式        12 条，「到底是低毒还是剧毒」被截成「底是低毒还是居」
+        global 多数票    13 条但 11/13 = 85%，仍截断
+     原因无法调和：**某个像素在多数镜头里是背景、在少数镜头里是文字**，
+     抹掉它就切断了文字。"台标"与"持续两三秒的字幕"在像素层面无法区分。
+
+结论：**像素级静态遮罩在这类素材上做不安全。** 代码留着（--mask-static）供以后研究，
+但默认关闭；真要用请先在没有台标的素材上确认不掉准确率。
+
+可行的方向（未实现）：**文字级**处理 —— 对同一位置的多次读法求最长公共子串，
+把反复出现的那段当静态前缀剥掉，保留会变的部分。这比像素方案更贴近实际失效点。
+
 性能要点（重要）
 ----------------
 proot 容器里**单次 OCR 要 2~15 秒**（热节流影响很大）。逐帧 OCR 一条 80 秒的视频
@@ -214,7 +241,8 @@ def mmss(t):
     return "%d:%02d" % (int(t // 60), int(t % 60))
 
 
-def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score):
+def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score,
+               mask_of=None):
     """把一批时刻的带图竖拼成一张再 OCR，按 y 归位。返回 {i: [items]}"""
     from PIL import Image
     imgs = []
@@ -222,6 +250,8 @@ def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score)
         p = os.path.join(tmpd, "b%d.png" % i)
         im = None
         if grab_frame(video, i / fps, p, crop=(0, by, W, bh), scale=upscale):
+            if mask_of is not None:
+                apply_mask(p, mask_of(i))
             try:
                 im = Image.open(p).convert("RGB")
                 im.load()
@@ -256,6 +286,112 @@ def _ocr_stack(video, idxs, fps, by, W, bh, upscale, tmpd, batch_tag, min_score)
     return per
 
 
+# ------------------------------------------------- 静态元素遮罩（按镜头）
+
+def shot_masks(video, W, dur, by, bh, upscale, tmpd,
+               cut_thresh=18.0, min_shot=4, thresh=6.0, max_frames=200,
+               mode="shot"):
+    """**按镜头**算静态像素遮罩 —— 本工具最关键的一处修正。
+
+    实测教训（为什么不能整片算）
+    ---------------------------
+    第一版按「全片 24 帧」算时间维标准差，结果 σ 中位 75.7、σ<3 的像素占 0% ——
+    看起来"整个画面都在变"，方法像是失效了。按窗口细分就露馅了：
+
+        全片        σ 中位 75.73   σ<3 占  0.0%
+        5s~8s 内    σ 中位  0.49   σ<3 占 86.0%   ← 单镜头内
+
+    那条素材有 31 个切点。**整片统计量的是"镜头之间的差异"，不是"静 vs 动"。**
+
+    做法：抓一批带图 → 相邻帧差找切点 → 分镜 → 每个镜头内部算时间维 σ，
+    σ<thresh 的像素即静态（台标/固定图卡）；OCR 前把这些像素抹成平色。
+    镜头帧数少于 min_shot 就不遮罩，避免误判。
+
+    返回 shots = [{t0, t1, n_frames, mask|None, static_fraction|None}, ...]
+    """
+    import numpy as _np
+    from PIL import Image
+    mf = 200 if max_frames is None else int(max_frames)
+    k = max(12, min(mf, int(dur * 2) if dur > 0 else 24))
+    ts = _np.linspace(0.5, max(0.6, dur - 0.5), k) if dur > 1 else _np.linspace(0, 1, 12)
+    frames, kt = [], []
+    for i, t in enumerate(ts):
+        p = os.path.join(tmpd, "smf%d.png" % i)
+        if not grab_frame(video, float(t), p, crop=(0, by, W, bh), scale=upscale):
+            continue
+        try:
+            im = Image.open(p).convert("L")
+            im.load()
+            frames.append(_np.asarray(im, dtype=_np.float32))
+            kt.append(float(t))
+        except Exception:
+            pass
+        if os.path.exists(p):
+            os.unlink(p)
+    if len(frames) < min_shot:
+        return []
+    cuts = [0]
+    for i in range(1, len(frames)):
+        d = float(_np.abs(frames[i] - frames[i - 1]).mean())
+        if d > cut_thresh or (kt[i] - kt[i - 1]) > 3.0:
+            cuts.append(i)
+    cuts.append(len(frames))
+    shots = []
+    for si in range(len(cuts) - 1):
+        a_, b_ = cuts[si], cuts[si + 1]
+        idx = list(range(a_, b_))
+        t0, t1 = kt[a_], kt[min(b_, len(kt) - 1)]
+        if len(idx) < min_shot:
+            shots.append({"t0": round(t0, 2), "t1": round(t1, 2), "n_frames": len(idx),
+                          "mask": None, "static_fraction": None})
+            continue
+        A = _np.stack([frames[i] for i in idx], 0)
+        m = A.std(axis=0) < float(thresh)
+        shots.append({"t0": round(t0, 2), "t1": round(t1, 2), "n_frames": len(idx),
+                      "mask": m, "static_fraction": round(float(m.mean()), 3)})
+    if mode == "global":
+        # 只有「在多数镜头里都静态」的像素才抹掉 —— 这是区分「持续叠加的台标」
+        # 与「持续两三秒的字幕」的关键：
+        #   台标在几乎每个镜头里都不变 → 多数票通过 → 该抹
+        #   字幕每句文字不同，同一像素在不同镜头里取值不同 → 少数票 → 不该抹
+        got = [x["mask"] for x in shots if x.get("mask") is not None]
+        if got:
+            import numpy as _np
+            vote = _np.mean(_np.stack([g.astype(_np.float32) for g in got], 0), axis=0)
+            gm = vote >= 0.8
+            for x in shots:
+                if x.get("mask") is not None:
+                    x["mask"] = gm
+                    x["static_fraction"] = round(float(gm.mean()), 3)
+    return shots
+
+
+def mask_at(shots, t):
+    if not shots:
+        return None
+    for sh in shots:
+        if sh["t0"] <= t <= sh["t1"]:
+            return sh.get("mask")
+    return min(shots, key=lambda sh: min(abs(t - sh["t0"]), abs(t - sh["t1"]))).get("mask")
+
+
+def apply_mask(img_path, mask, fill=127):
+    if mask is None:
+        return False
+    import numpy as _np
+    from PIL import Image
+    try:
+        im = Image.open(img_path).convert("RGB")
+        a = _np.asarray(im).copy()
+        if mask.shape[:2] != a.shape[:2]:
+            return False
+        a[mask] = fill
+        Image.fromarray(a).save(img_path)
+        return True
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------- 主流程
 
 def main():
@@ -270,6 +406,18 @@ def main():
     ap.add_argument("--sim", type=float, default=0.7, help="合并两条字幕的相似度阈值")
     ap.add_argument("--max-gap", type=float, default=1.2, help="间隔超过此秒数即断开")
     ap.add_argument("--min-score", type=float, default=0.4, help="带内 OCR 的最低置信度")
+    ap.add_argument("--mask-static", action="store_true", default=False,
+                    help="⚠ 实验性且**实测有害**：像素级静态遮罩（抹掉台标/固定图卡）。"
+                         "合成素材实测把 100% 打成 85%（字幕被截断），默认关闭。详见文件头说明。")
+    ap.add_argument("--no-mask-static", dest="mask_static", action="store_false",
+                    help="关闭静态遮罩（默认）")
+    ap.add_argument("--mask-thresh", type=float, default=6.0,
+                    help="镜头内时间维标准差低于此值算静像素（默认 6.0）")
+    ap.add_argument("--cut-thresh", type=float, default=18.0,
+                    help="判切点的帧差阈值（默认 18.0；越小切得越碎）")
+    ap.add_argument("--mask-mode", choices=["shot", "global"], default="global",
+                    help="shot=镜头内静态就抹（会把持续几秒的字幕也抹掉，实测有害）；"
+                         "global=要在多数镜头里都静态才抹（默认，能区分台标与字幕）")
     a = ap.parse_args()
 
     out = a.out or os.path.splitext(a.video)[0] + "_subband"
@@ -305,10 +453,32 @@ def main():
     print("分批 OCR：%sfps × %d 个时刻，每批 %d 张 → %d 次调用（带内 %dx%d，放大 %d×）"
           % (a.fps, n, a.batch, nb, W, bh, a.upscale))
     tmpd = tempfile.mkdtemp(prefix="subband_")
+
+    # 按镜头的静态遮罩（台标/固定图卡会被抹掉再 OCR）
+    shots = []
+    if a.mask_static:
+        shots = shot_masks(a.video, W, dur, by, bh, a.upscale, tmpd,
+                           a.cut_thresh, 4, a.mask_thresh, None, a.mask_mode)
+        got = [x["static_fraction"] for x in shots if x.get("static_fraction") is not None]
+        if shots:
+            print("静态遮罩（按镜头）：切成 %d 段，%d 段做了遮罩，镜头内静像素占比中位 %.0f%%"
+                  % (len(shots), len(got),
+                     (sorted(got)[len(got)//2] if got else 0) * 100))
+            for r in shots[:6]:
+                if r.get("static_fraction") is not None:
+                    print("   镜头 %5.1fs~%5.1fs  %2d 帧  静像素 %.0f%%"
+                          % (r["t0"], r["t1"], r["n_frames"], r["static_fraction"] * 100))
+        else:
+            print("静态遮罩：样本不足，跳过")
+
+    def _mask_of(i):
+        return mask_at(shots, i / a.fps) if shots else None
+
     rows = []
     for b, b0 in enumerate(range(0, n, a.batch)):
         idxs = list(range(b0, min(n, b0 + a.batch)))
-        per = _ocr_stack(a.video, idxs, a.fps, by, W, bh, a.upscale, tmpd, str(b), a.min_score)
+        per = _ocr_stack(a.video, idxs, a.fps, by, W, bh, a.upscale, tmpd, str(b),
+                         a.min_score, _mask_of if shots else None)
         for i in idxs:
             got = per.get(i)
             if got:
@@ -329,6 +499,7 @@ def main():
               "stats": {"n_ocr_steps": n, "n_ocr_calls": nb, "n_text_moments": len(rows),
                         "n_entries": len(entries),
                         "total_text_seconds": round(sum(e["duration"] for e in entries), 1)},
+              "shots": [{k: v for k, v in sh.items() if k != "mask"} for sh in shots],
               "entries": entries}
     with open(os.path.join(out, "subband.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
